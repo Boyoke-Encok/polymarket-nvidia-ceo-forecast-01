@@ -1,20 +1,21 @@
 // polymarket-nvidia-ceo-forecast-01 entry (Node 22, standard library only).
 //
-// Approach: persistence median (last price) with a small fade and a gentle
-// mean-reversion of the last hour's move, pulled slowly toward the
-// board-normalised level (the 24 Yes prices sum to ~1.06, so each market's
-// fair level is its price divided by the board sum). The spread is
-// per-market and per-horizon, from two volatility views combined in
-// quadrature:
+// Approach (v3): persistence median with NO fade and NO reversion of the last
+// 15 minutes' move — the recent move is noise/momentum, not signal — but a
+// strong mean-reversion (-0.55) of the 15-to-60-minute slice, pulled toward
+// the board-normalised level (the 24 Yes prices sum to ~1.06, so each
+// market's fair level is its price divided by the board sum) with a
+// 180-minute time constant. The spread is per-market and per-horizon, from
+// two volatility views combined in quadrature:
 //
 //   1. a robust view: sigma(h) from the interquartile range of past h-minute
-//      changes over the last 24 h, scaled by 0.35 (the past is jumpier than
-//      the next 4 h). Young markets fall back to their own 1-minute IQR
-//      volatility scaled by sqrt(h) instead of the house baseline's tiny
-//      0.0025, which was far too narrow for markets moving 0.04-0.08/min.
+//      changes over the last 24 h, scaled by 0.30. Young markets fall back
+//      to their own 1-minute IQR volatility scaled by sqrt(h) instead of the
+//      house baseline's tiny 0.0025, which was far too narrow for markets
+//      moving 0.04-0.08/min.
 //   2. a fast-scale guard: the winsorised (capped at 0.05) exponentially
 //      weighted 1-minute volatility with a 30-minute half-life, scaled by
-//      0.8 and sqrt(h). It only bites when recent trading is hot, so bands
+//      1.0 and sqrt(h). It only bites when recent trading is hot, so bands
 //      widen in volatile regimes instead of staying stuck at the calm
 //      24-hour IQR level.
 //
@@ -24,11 +25,24 @@
 // horizon grid and forced non-decreasing in h. No empirical-quantile blend:
 // once the guard is in, the empirical part only adds noise.
 //
+// What was tried and rejected on the walk-forward backtest: reverting the
+// last 5 or 15 minutes (hurts — that move is not mean-reverting), any direct
+// jump correction (up-jumps reverse ~fully, but almost all of the reversal
+// happens within minutes, before the checkpoint, so correcting for it
+// double-counts), board-sum-change and leader-rotation terms (no signal
+// once the level pull is in), a fade for young markets (helps only the
+// early practice cases, whose markets are young; the final's markets are
+// all 27+ hours old, so it cannot fire there), and blends with the house
+// baseline or the v2 model.
+//
 // Backtest (walk-forward on the practice cases, scored against the next
-// case's history; mean pinball loss x100, lower better): this program 0.296
-// pooled over p00-p04 (house baseline 0.393, original entry 0.333). On four
-// extra mature in-history checkpoints it scores 0.305. Per case: p00 0.448,
-// p01 0.293, p02 0.345, p03 0.243, p04 0.190.
+// case's history; mean pinball loss x100, lower better): this program 0.285
+// pooled over p00-p04 (house baseline 0.393, v2 0.296, original entry
+// 0.333); 0.280 pooled over p01-p04 plus four extra mature in-history
+// checkpoints (v2 0.295); median error 0.812 (v2 0.868). Per case: p00
+// 0.443, p01 0.288, p02 0.306, p03 0.251, p04 0.174. The gain over v2 is
+// broad: it beats v2 on every leave-one-case-out recomputation of the
+// pooled score.
 //
 // It runs offline, with no network: everything it knows is in the case file.
 //   mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out node main.ts
@@ -48,21 +62,22 @@ const HGRID = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 180, 240];
 /** How much recent history calibrates the spread (minutes). */
 const WINDOW_MIN = 1440;
 /** Shrinkage of the IQR-implied sigma (the past is jumpier than the next 4 h). */
-const SIGMA_SCALE = 0.35;
+const SIGMA_SCALE = 0.3;
 /** Minimum change samples for a horizon's estimates; below it, fall back to own 1-min vol. */
 const MIN_SAMPLES = 30;
-/** Median fade per hour (prices drift down slightly on average). */
-const FADE_PER_HOUR = 0.01;
-/** Mean-reversion of the last hour's move: window, beta, ramp horizon. */
+/** Median fade per hour: 0 — tested, the drift is already in the level pull. */
+const FADE_PER_HOUR = 0;
+/** Mean-reversion of the 15-to-60-minute slice of the last hour's move. */
+const REV_SHORT = 15;
 const REV_WINDOW = 60;
-const REV_BETA = -0.3;
+const REV_BETA = -0.55;
 const REV_H = 240;
-/** Ornstein-Uhlenbeck pull of the median toward the board-normalised level. */
-const PULL_TAU = 480;
+/** Pull of the median toward the board-normalised level (tau in minutes). */
+const PULL_TAU = 180;
 /** Fast-scale guard: EWMA half-life (min), winsor cap, and its weight. */
 const GUARD_HALFLIFE = 30;
 const GUARD_CAP = 0.05;
-const GUARD_K = 0.8;
+const GUARD_K = 1.0;
 /** Per-quantile band multipliers (q05, q25, q50, q75, q95). */
 const SHAPE = [1.4, 1.0, 1.0, 0.9, 1.3];
 
@@ -121,7 +136,7 @@ function cumMax(a: number[]): void {
  * price. The spread is the IQR sigma interpolated in sqrt(h), combined in
  * quadrature with the fast-scale guard, and forced non-decreasing in h.
  */
-function forecast(m: CaseMarket, horizon: number, quantiles: number[], zs: number[]): number[][] {
+function forecast(m: CaseMarket, horizon: number, quantiles: number[], zs: number[], target: number | null): number[][] {
   const p = m.prices;
   const n = p.length;
   if (n === 0) return Array.from({ length: horizon }, () => quantiles.map(() => 0.5));
@@ -183,13 +198,20 @@ function forecast(m: CaseMarket, horizon: number, quantiles: number[], zs: numbe
   }
   cumMax(sig);
 
-  // Median: last price, gentle fade, gentle mean-reversion of the last hour.
+  // Median: last price, no fade. Only the 15-to-60-minute slice of the last
+  // hour's move reverts: the last 15 minutes' move is not mean-reverting
+  // (tested: reverting it hurts), and neither is the 60-240-minute slice.
+  // The median is also pulled toward the board-normalised level (target),
+  // ramping in over PULL_TAU.
   const r60 = x - (n > REV_WINDOW ? (p[n - 1 - REV_WINDOW] as number) : (p[0] as number));
+  const r15 = x - (n > REV_SHORT ? (p[n - 1 - REV_SHORT] as number) : (p[0] as number));
+  const rev = REV_BETA * (r60 - r15);
   const rows: number[][] = [];
   for (let i = 0; i < horizon; i++) {
     const h = hs[i] as number;
     let med = x * Math.exp(-FADE_PER_HOUR * (h / 60));
-    med += REV_BETA * r60 * Math.min(1, h / REV_H);
+    med += rev * Math.min(1, h / REV_H);
+    if (target !== null) med += (target - x) * (1 - Math.exp(-h / PULL_TAU));
     const s = SIGMA_SCALE * (sig[i] as number);
     const row = quantiles.map((_, k) => {
       const dev = (zs[k] as number) * s * (SHAPE[k] as number);
@@ -238,34 +260,17 @@ for (const file of inputs) {
   const standard = c.quantiles.length === QUANTILES.length && c.quantiles.every((t, j) => t === QUANTILES[j]);
   const quantiles = standard ? QUANTILES : c.quantiles;
   const zs = standard ? Z : quantiles.map((t) => normQuantile(t));
-  const forecasts = c.markets.map((m) => ({ id: m.id, q: forecast(m, c.horizon_minutes, quantiles, zs) }));
-
-  // Board pull: the medians drift toward each market's board-normalised level
-  // (its price divided by the sum of all last prices), exponentially with a
-  // 480-minute time constant. Bands shift with the median, unchanged in width.
+  // The 24 Yes prices sum to ~1.06, so each market's fair level is its
+  // price divided by the board sum. The pull is part of the median inside
+  // forecast(), not a post-pass.
   const boardSum = c.markets.reduce(
     (acc, m) => acc + (m.prices.length ? (m.prices[m.prices.length - 1] as number) : 0),
     0,
   );
-  if (boardSum > 0) {
-    for (let mi = 0; mi < c.markets.length; mi++) {
-      const m = c.markets[mi] as CaseMarket;
-      if (!m.prices.length) continue;
-      const x = m.prices[m.prices.length - 1] as number;
-      const target = x / boardSum;
-      const f = (forecasts[mi] as { id: string; q: number[][] }).q;
-      for (let i = 0; i < f.length; i++) {
-        const h = i + 1;
-        const decay = Math.exp(-h / PULL_TAU);
-        const row = f[i] as number[];
-        const med = row[2] as number;
-        const newMed = target + (med - target) * decay;
-        const shifted = row.map((v) => price6(v + (newMed - med)));
-        shifted.sort((a, b) => a - b);
-        f[i] = shifted;
-      }
-    }
-  }
+  const forecasts = c.markets.map((m) => {
+    const target = boardSum > 0 && m.prices.length ? (m.prices[m.prices.length - 1] as number) / boardSum : null;
+    return { id: m.id, q: forecast(m, c.horizon_minutes, quantiles, zs, target) };
+  });
 
   writeFileSync(join(OUTPUT_DIR, `${id}.out`), `${JSON.stringify({ forecasts })}\n`);
 }
